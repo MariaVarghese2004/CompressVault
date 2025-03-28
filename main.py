@@ -1,14 +1,17 @@
+import datetime
+import subprocess
 from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 import io
-import os
+import os  # Import os module
+
+import pyodbc
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 from fastapi.middleware.cors import CORSMiddleware
-
 
 app = FastAPI()
 app.add_middleware(
@@ -18,6 +21,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Database connection settings
+connection_string = r'DRIVER={ODBC Driver 17 for SQL Server};SERVER=(LocalDb)\MSSQLLocalDB;DATABASE=FileCompression;Trusted_Connection=yes;'
 
 def compress_jpeg_image(input_image: Image.Image, output_io: io.BytesIO, quality=70):
     """Compress JPEG image by removing metadata and adjusting quality."""
@@ -62,8 +68,6 @@ def compress_and_convert(input_image: Image.Image, jpeg_quality=75, original_siz
     final_png_io.seek(0)  # Reset stream position before returning
     return final_png_io
 
-
-
 def compress_image(input_image: Image.Image, output_io: io.BytesIO, max_size_kb, initial_quality=85, min_quality=40):
     """Compress image and adjust quality to ensure size is under max_size_kb without resizing."""
     quality = initial_quality
@@ -97,7 +101,56 @@ def calculate_image_similarity(image1: Image.Image, image2: Image.Image):
     img1 = np.array(image1)
     img2 = np.array(image2)
     similarity_index, _ = ssim(img1, img2, full=True)
-    return similarity_index * 100                                                                                                 
+    return similarity_index * 100
+
+def compress_pdf(input_pdf: io.BytesIO, output_pdf: io.BytesIO, quality='printer'):
+    # Write input PDF to a temporary file
+    temp_input_path = "temp_input.pdf"
+    with open(temp_input_path, 'wb') as f:
+        f.write(input_pdf.read())
+
+    # Define the output temporary file path
+    temp_output_path = "temp_output.pdf"
+
+    # Ghostscript command to compress PDF
+    command = [
+        r'C:\Program Files\gs\gs10.04.0\bin\gswin64.exe',  # Adjust the path as needed
+        '-sDEVICE=pdfwrite',
+        '-dCompatibilityLevel=1.4',
+        f'-dPDFSETTINGS=/{quality}',
+        '-dNOPAUSE',
+        '-dBATCH',
+        '-sOutputFile=' + temp_output_path,
+        temp_input_path
+    ]
+
+    try:
+        subprocess.run(command, check=True)
+
+        # Read the compressed PDF back into the output PDF IO stream
+        with open(temp_output_path, 'rb') as f:
+            output_pdf.write(f.read())
+
+        # Clean up temporary files
+        os.remove(temp_input_path)
+        os.remove(temp_output_path)
+
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"An error occurred while compressing the PDF: {e}")
+                                                                                             
+
+
+def insert_file_stats(file_name, original_size_kb, compressed_size_kb, similarity_percentage):
+    """Call stored procedure to insert file statistics into the database."""
+    try:
+        with pyodbc.connect(connection_string) as conn:
+            cursor = conn.cursor()
+            cursor.execute("{CALL InsertFileStats_Updated (?, ?, ?, ?)}",
+                           (file_name, original_size_kb, compressed_size_kb, similarity_percentage))
+            conn.commit()
+            print("Data inserted successfully")
+    except pyodbc.Error as e:
+        print(f"Database insert error: {e}")
 
 
 @app.post("/get-image-stats/")
@@ -145,6 +198,13 @@ async def get_image_stats(file: UploadFile = File(...)):
         # Calculate similarity percentage
         compressed_image = Image.open(output_io)
         similarity_percentage = calculate_image_similarity(image, compressed_image)
+        #created_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+
+        insert_file_stats(file.filename, original_size_kb, compressed_size_kb, similarity_percentage)
+
+        # Insert file stats into database
+#        insert_file_stats(original_size_kb, compressed_size_kb, similarity_percentage)
 
         # Prepare the response
         return JSONResponse(content={
@@ -154,10 +214,7 @@ async def get_image_stats(file: UploadFile = File(...)):
         })
 
     except Exception as e:
-        return JSONResponse(content={"error": str(e)})
-
-
-ALLOWED_FORMATS = ['image/jpeg', 'image/png', 'image/tiff', 'image/bmp']
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/process-image/")
 async def process_image(file: UploadFile = File(...)):
@@ -184,28 +241,73 @@ async def process_image(file: UploadFile = File(...)):
         elif file_extension == '.tiff':
             image = image.convert('P', palette=Image.ADAPTIVE, colors=256)
             image.save(output_io, format='TIFF', compression='tiff_lzw')
-        
+            media_type = 'image/tiff'
+
         elif file_extension == '.bmp':
             image = image.convert('P', palette=Image.ADAPTIVE, colors=256)
             image.save(output_io, format='BMP')
+            media_type = 'image/bmp'
         
+        elif file_extension == '.pdf':
+            # Handle PDF file
+            input_pdf_io = io.BytesIO(await file.read())
+            output_pdf_io = io.BytesIO()
+
+            compress_pdf(input_pdf_io, output_pdf_io, quality='screen')
+
+            output_pdf_io.seek(0)
+            return StreamingResponse(output_pdf_io, media_type='application/pdf', headers={
+                "Content-Disposition": f"attachment; filename=compressed_{file.filename}"
+            })
+
         else:
             return JSONResponse(content={"message": "Only JPEG, PNG, TIFF, and BMP formats are supported"})
         
+        # Prepare the response
         output_io.seek(0)
-        compressed_image = Image.open(output_io)
-        similarity_percentage = calculate_image_similarity(image, compressed_image)
-
-        if similarity_percentage >= 80:
-         output_io.seek(0)
-         response = StreamingResponse(output_io, media_type=media_type)
-         response.headers["Content-Disposition"] = f"attachment; filename={file.filename}"
-         return response
-        else:
-            return JSONResponse(content={"message": "Image similarity is less than 80%."})
+        response = StreamingResponse(output_io, media_type=media_type)
+        response.headers["Content-Disposition"] = f"attachment; filename={file.filename}"
+        return response
 
     except Exception as e:
-        return JSONResponse(content={"error": str(e)})
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.post("/process-pdf/")
+async def process_image(file: UploadFile = File(...)):
+    try:
+        # Load the image from the uploaded file
+       
+        file_extension = os.path.splitext(file.filename)[-1].lower()
+
+        if file_extension in ['.jpeg', '.jpg']:
+            # Compress JPEG image
+            #compress_image(image, output_io, max_size_kb=70)
+            media_type = 'image/jpeg'
+        
+        elif file_extension == '.pdf':
+            # Handle PDF file
+            input_pdf_io = io.BytesIO(await file.read())
+            output_pdf_io = io.BytesIO()
+
+            compress_pdf(input_pdf_io, output_pdf_io, quality='screen')
+
+            output_pdf_io.seek(0)
+            return StreamingResponse(output_pdf_io, media_type='application/pdf', headers={
+                "Content-Disposition": f"attachment; filename=compressed_{file.filename}"
+            })
+
+        else:
+            return JSONResponse(content={"message": "Only JPEG, PNG, TIFF, and BMP formats are supported"})
+        
+        # Prepare the response
+     #   output_io.seek(0)
+      #  response = StreamingResponse(output_io, media_type=media_type)
+       # response.headers["Content-Disposition"] = f"attachment; filename={file.filename}"
+       # return response
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8050)
